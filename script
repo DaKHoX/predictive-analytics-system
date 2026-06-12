@@ -1,0 +1,2502 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import smtplib
+import mimetypes
+
+from email.message import EmailMessage
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+
+# 1. НАСТРОЙКИ ПРОЕКТА
+@dataclass
+class Config:
+    # Структура папок:
+    data_dir: Path = Path(r"F:\envs\oee-analytics\Data")  # изменить на свой путь
+
+    # Папка, куда будут сохраняться Excel-отчёт и графики
+    reports_dir: Path = Path(r"F:\envs\oee-analytics\reports")  # изменить на свой путь
+
+    # Подключение к PostgreSQL.
+    # ВАЖНО: база у тебя называется postgres.
+    # Замени YOUR_PASSWORD на свой пароль от пользователя postgres.
+    db_url: str = field(default_factory=lambda: os.getenv("OEE_DB_URL", ""))  # здесь вписать свой почтовый ящик
+
+    # Схема в DBeaver: Database postgres → Schema OEE
+    db_schema: str = "OEE"  # меняем название схемы
+
+    # Если True, таблицы будут удалены и созданы заново.
+    # Для первого теста можно поставить True.
+    # После проверки лучше вернуть False, чтобы случайно не стереть данные.
+    recreate_tables: bool = False  # меняем на True, если пересоздаем таблицы
+
+    # В Excel:
+    # A — блок потерь
+    # B — событие
+    # C-D, E-F, G-H, I-J, K-L — пары "начало-конец"
+    loss_block_col: str = "A"
+    event_col: str = "B"
+
+    # Если в Excel есть отдельный столбец количества, укажи его букву.
+    # Например, если количество стоит в M, необходимо сделать: quantity_col: Optional[str] = "M"
+    # Если такого столбца нет, оставь None.
+    quantity_col: Optional[str] = None  # меняем, если только есть столбец количества
+
+    time_pairs: tuple[tuple[str, str], ...] = (
+        ("C", "D"),
+        ("E", "F"),
+        ("G", "H"),
+        ("I", "J"),
+        ("K", "L"),
+    )
+
+    # Строки Excel, где находятся события
+    first_data_row: int = 2
+    last_data_row: int = 23
+
+    # Листы с днями месяца
+    first_sheet: int = 1
+    last_sheet: int = 31
+
+    # Эти строки в БД не загружаются
+    skip_loss_block: str = "итоговый показатель блока"
+
+    # Нормативное время изготовления одной единицы продукции, мин.
+    # Если у тебя появится отдельная таблица нормативов, это значение можно будет заменить.
+    default_standard_time_per_unit_min: float = 1.0  # меняем под свой норматив
+
+    # Целевой OEE
+    oee_target: float = 0.85  # здесь устанавливаем целевой норматив
+    
+    # Плановое рабочее время в день  
+    planned_time_per_day_min: float = 480.0
+
+    # При повторном запуске удаляет старые записи по тем же Excel-файлам
+    clear_existing_for_loaded_files: bool = True
+    # Получатель отчёта
+    email_recipient: str = os.getenv("OEE_EMAIL_RECIPIENT", "")
+
+    # SMTP-настройки Gmail
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+
+    # Логин и пароль будут взяты из переменных окружения
+    smtp_user_env: str = "OEE_SMTP_USER"
+    smtp_password_env: str = "OEE_SMTP_PASSWORD"
+
+CFG = Config()
+
+
+# 2. СПРАВОЧНИК СОБЫТИЙ
+EVENT_DICTIONARY = {
+    "механика": {
+        "normalized_event": "потери по причине механических неисправностей",
+        "analytic_block": "техническая готовность оборудования",
+        "owner_group": "chief_mechanic",
+    },
+    "гидравлика": {
+        "normalized_event": "потери по причине неисправностей гидравлических систем",
+        "analytic_block": "техническая готовность оборудования",
+        "owner_group": "chief_mechanic",
+    },
+    "пневматика": {
+        "normalized_event": "потери по причине неисправностей пневматических систем",
+        "analytic_block": "техническая готовность оборудования",
+        "owner_group": "chief_mechanic",
+    },
+    "электрооборудование": {
+        "normalized_event": "потери по причине неисправностей силового электрооборудования",
+        "analytic_block": "техническая готовность оборудования",
+        "owner_group": "chief_mechanic",
+    },
+    "электроника": {
+        "normalized_event": "потери по причине неисправностей электронных компонентов",
+        "analytic_block": "техническая готовность оборудования",
+        "owner_group": "chief_mechanic",
+    },
+    "наладка оборудования": {
+        "normalized_event": "потери времени на наладку и перенастройку оборудования",
+        "analytic_block": "подготовительно-заключительное время",
+        "owner_group": "chief_mechanic",
+    },
+    "оснастка оборудования": {
+        "normalized_event": "потери, связанные с технологической оснасткой",
+        "analytic_block": "ресурсная готовность операции",
+        "owner_group": "chief_mechanic",
+    },
+    "ппр": {
+        "normalized_event": "потери времени на планово-предупредительный ремонт",
+        "analytic_block": "регламентное обслуживание",
+        "owner_group": "chief_mechanic",
+    },
+    "аварийная ситуация": {
+        "normalized_event": "потери по причине внештатной аварийной остановки",
+        "analytic_block": "нерегламентированные простои",
+        "owner_group": "chief_mechanic",
+    },
+    "отсутствие деталей с предыдущей операции": {
+        "normalized_event": "потери из-за отсутствия деталей с предыдущей операции",
+        "analytic_block": "межоперационная готовность",
+        "owner_group": "dispatcher",
+    },
+    "невостребованность мощностей": {
+        "normalized_event": "потери из-за отсутствия производственной загрузки",
+        "analytic_block": "организационно-производственная готовность",
+        "owner_group": "production_manager",
+    },
+    "организационные причины": {
+        "normalized_event": "потери по организационным причинам",
+        "analytic_block": "организационно-производственная готовность",
+        "owner_group": "production_manager",
+    },
+    "уборка оборудования": {
+        "normalized_event": "потери времени на очистку и подготовку рабочего места",
+        "analytic_block": "обслуживание рабочего места",
+        "owner_group": "production_manager",
+    },
+    "исправление несоответствующих качеству изделий": {
+        "normalized_event": "потери времени на исправление несоответствующей продукции",
+        "analytic_block": "качество и доработка",
+        "owner_group": "quality_service",
+    },
+    "проверка изделий": {
+        "normalized_event": "потери времени на контроль и проверку изделий",
+        "analytic_block": "качество и контроль",
+        "owner_group": "quality_service",
+    },
+    "изготовление изделий": {
+        "normalized_event": "время фактического изготовления продукции",
+        "analytic_block": "производительное время",
+        "owner_group": "production_manager",
+    },
+    "установленные перерывы": {
+        "normalized_event": "регламентированные перерывы в работе",
+        "analytic_block": "плановое непроизводственное время",
+        "owner_group": "production_manager",
+    },
+    "исправные изделия": {
+        "normalized_event": "количество годных изделий",
+        "analytic_block": "результат выпуска",
+        "owner_group": "quality_service",
+    },
+    "изделия несоответствующие установленному качеству": {
+        "normalized_event": "количество изделий с выявленными несоответствиями",
+        "analytic_block": "результат выпуска и качество",
+        "owner_group": "quality_service",
+    },
+}
+
+
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+def quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def table_name(cfg: Config, name: str) -> str:
+    return f"{quote_ident(cfg.db_schema)}.{name}"
+
+
+def col_letter_to_index(col_letter: str) -> int:
+    col_letter = col_letter.upper().strip()
+    result = 0
+
+    for char in col_letter:
+        result = result * 26 + (ord(char) - ord("A") + 1)
+
+    return result - 1
+
+
+def clean_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def normalize_key(value) -> str:
+    return clean_text(value).lower().replace("ё", "е")
+
+
+def safe_to_datetime(value):
+    if pd.isna(value):
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce", dayfirst=True)
+
+
+def get_numeric(value, default: float = 0.0) -> float:
+    if pd.isna(value):
+        return default
+
+    try:
+        return float(str(value).replace(",", "."))
+    except ValueError:
+        return default
+
+
+def get_event_info(event_name: str) -> dict:
+    key = normalize_key(event_name)
+
+    return EVENT_DICTIONARY.get(
+        key,
+        {
+            "normalized_event": event_name,
+            "analytic_block": "прочее",
+            "owner_group": "production_manager",
+        },
+    )
+
+
+def parse_file_info(file_path: Path, data_dir: Path) -> dict:
+    """
+    Ожидаемая структура:
+
+    Data/
+        Аггрегатный станок/
+            234859/
+                Аггрегатный станок,234859,01.24.xlsm
+
+    Модель станка берётся из папки первого уровня.
+    Табельный номер берётся из папки второго уровня.
+    Месяц и год берутся из имени Excel-файла.
+    """
+
+    relative_path = file_path.resolve().relative_to(data_dir.resolve())
+
+    if len(relative_path.parts) < 3:
+        raise ValueError(
+            f"Некорректное расположение файла: {file_path}. "
+            f"Ожидается структура: Data/модель_станка/табельный_номер/файл.xlsm"
+        )
+
+    machine_model = relative_path.parts[0]
+    machine_tab_number = relative_path.parts[1]
+
+    stem = file_path.stem
+    parts = [part.strip() for part in stem.split(",")]
+
+    # Основной формат: Аггрегатный станок,234859,01.24
+    if len(parts) >= 3:
+        date_part = parts[2].rstrip(".")
+    else:
+        # Допустимый короткий вариант: 01.24
+        date_part = stem.strip().rstrip(".")
+
+    date_parts = date_part.split(".")
+
+    if len(date_parts) != 2:
+        raise ValueError(
+            f"Некорректная дата в имени файла: {file_path.name}. "
+            f"Ожидаемый формат: ММ.ГГ, например 01.24"
+        )
+
+    month_num = int(date_parts[0])
+    year_num = 2000 + int(date_parts[1])
+
+    if month_num < 1 or month_num > 12:
+        raise ValueError(f"Некорректный месяц в имени файла: {file_path.name}")
+
+    return {
+        "machine_model": machine_model,
+        "machine_tab_number": machine_tab_number,
+        "month_num": month_num,
+        "year_num": year_num,
+        "month_key": pd.Timestamp(year=year_num, month=month_num, day=1).date(),
+    }
+
+
+# 4. ПОДКЛЮЧЕНИЕ И СОЗДАНИЕ ТАБЛИЦ
+def get_engine(cfg: Config) -> Engine:
+    return create_engine(cfg.db_url)
+
+
+def create_tables(engine: Engine, cfg: Config) -> None:
+    schema = quote_ident(cfg.db_schema)
+
+    drop_sql = f"""
+    DROP TABLE IF EXISTS {schema}.oee_load_errors CASCADE;
+    DROP TABLE IF EXISTS {schema}.oee_monthly_metrics CASCADE;
+    DROP TABLE IF EXISTS {schema}.oee_event_records CASCADE;
+    """
+
+    create_sql = f"""
+    CREATE SCHEMA IF NOT EXISTS {schema};
+
+    CREATE TABLE IF NOT EXISTS {schema}.oee_event_records (
+        id BIGSERIAL PRIMARY KEY,
+
+        source_file_name TEXT NOT NULL,
+        source_file_path TEXT NOT NULL,
+        source_sheet_name TEXT NOT NULL,
+        source_row_number INTEGER NOT NULL,
+        source_pair_label TEXT NOT NULL,
+
+        month_key DATE NOT NULL,
+        month_num INTEGER NOT NULL,
+        year_num INTEGER NOT NULL,
+        day_num INTEGER,
+
+        machine_model TEXT NOT NULL,
+        machine_tab_number TEXT NOT NULL,
+
+        loss_block TEXT NOT NULL,
+        event_name TEXT NOT NULL,
+        normalized_event_name TEXT,
+        analytic_block TEXT,
+        owner_group TEXT,
+
+        start_time TIMESTAMP NULL,
+        end_time TIMESTAMP NULL,
+        duration_min NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        has_time_interval BOOLEAN NOT NULL DEFAULT FALSE,
+
+        quantity_value NUMERIC(12, 2) DEFAULT 0,
+        good_qty NUMERIC(12, 2) DEFAULT 0,
+        defect_qty NUMERIC(12, 2) DEFAULT 0,
+        actual_output NUMERIC(12, 2) DEFAULT 0,
+
+        planned_time_min NUMERIC(12, 2) DEFAULT 0,
+        standard_time_per_unit_min NUMERIC(12, 4) DEFAULT 1,
+
+        loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        CONSTRAINT chk_oee_time_interval
+            CHECK (
+                (start_time IS NULL AND end_time IS NULL)
+                OR
+                (start_time IS NOT NULL AND end_time IS NOT NULL AND end_time >= start_time)
+            ),
+
+        CONSTRAINT chk_oee_duration_non_negative
+            CHECK (duration_min >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS {schema}.oee_monthly_metrics (
+        id BIGSERIAL PRIMARY KEY,
+
+        month_key DATE NOT NULL,
+
+        machine_model TEXT NOT NULL,
+        machine_tab_number TEXT NOT NULL,
+
+        planned_time_min NUMERIC(12, 2),
+        downtime_min NUMERIC(12, 2),
+        actual_work_time_min NUMERIC(12, 2),
+
+        actual_output NUMERIC(12, 2),
+        standard_output NUMERIC(12, 2),
+        good_qty NUMERIC(12, 2),
+        defect_qty NUMERIC(12, 2),
+
+        availability NUMERIC(10, 4),
+        performance NUMERIC(10, 4),
+        quality NUMERIC(10, 4),
+        oee NUMERIC(10, 4),
+
+        oee_target NUMERIC(10, 4),
+        oee_deviation NUMERIC(10, 4),
+        oee_relative_deviation NUMERIC(10, 4),
+
+        calculated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS {schema}.oee_daily_metrics (
+        id BIGSERIAL PRIMARY KEY,
+
+        day_key DATE NOT NULL,
+        month_key DATE NOT NULL,
+
+        machine_model TEXT NOT NULL,
+        machine_tab_number TEXT NOT NULL,
+
+        planned_time_min NUMERIC(12, 2),
+        downtime_min NUMERIC(12, 2),
+        actual_work_time_min NUMERIC(12, 2),
+
+        actual_output NUMERIC(12, 2),
+        standard_output NUMERIC(12, 2),
+        good_qty NUMERIC(12, 2),
+        defect_qty NUMERIC(12, 2),
+
+        availability NUMERIC(10, 4),
+        performance NUMERIC(10, 4),
+        quality NUMERIC(10, 4),
+        oee NUMERIC(10, 4),
+
+        oee_target NUMERIC(10, 4),
+        oee_deviation NUMERIC(10, 4),
+        oee_relative_deviation NUMERIC(10, 4),
+
+        calculated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_oee_daily_day
+        ON {schema}.oee_daily_metrics (day_key);
+
+    CREATE INDEX IF NOT EXISTS idx_oee_daily_machine
+        ON {schema}.oee_daily_metrics (machine_model, machine_tab_number);
+
+    CREATE INDEX IF NOT EXISTS idx_oee_daily_machine_day
+        ON {schema}.oee_daily_metrics (machine_model, machine_tab_number, day_key);
+        
+    CREATE TABLE IF NOT EXISTS {schema}.oee_load_errors (
+        id BIGSERIAL PRIMARY KEY,
+
+        source_file_name TEXT,
+        source_file_path TEXT,
+        source_sheet_name TEXT,
+        source_row_number INTEGER,
+        source_pair_label TEXT,
+
+        error_type TEXT,
+        error_details TEXT,
+
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_oee_event_month
+        ON {schema}.oee_event_records (month_key);
+
+    CREATE INDEX IF NOT EXISTS idx_oee_event_machine
+        ON {schema}.oee_event_records (machine_model, machine_tab_number);
+
+    CREATE INDEX IF NOT EXISTS idx_oee_event_machine_month
+        ON {schema}.oee_event_records (machine_model, machine_tab_number, month_key);
+
+    CREATE INDEX IF NOT EXISTS idx_oee_event_loss_block
+        ON {schema}.oee_event_records (loss_block);
+    """
+
+    with engine.begin() as conn:
+        if cfg.recreate_tables:
+            conn.execute(text(drop_sql))
+        conn.execute(text(create_sql))
+
+
+# 5. ЧТЕНИЕ EXCEL И ФОРМИРОВАНИЕ ЗАПИСЕЙ
+def build_records_from_sheet(
+    df: pd.DataFrame,
+    file_path: Path,
+    sheet_name: str,
+    cfg: Config,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+    file_info = parse_file_info(file_path, cfg.data_dir)
+
+    loss_idx = col_letter_to_index(cfg.loss_block_col)
+    event_idx = col_letter_to_index(cfg.event_col)
+    quantity_idx = col_letter_to_index(cfg.quantity_col) if cfg.quantity_col else None
+
+    # Если в столбце блока потерь используются объединённые ячейки,
+    # pandas прочитает нижние строки как пустые. Поэтому блок потерь протягивается вниз.
+    if loss_idx < len(df.columns):
+        df.iloc[:, loss_idx] = df.iloc[:, loss_idx].ffill()
+
+    try:
+        day_num = int(sheet_name)
+    except ValueError:
+        day_num = None
+
+    records: list[dict] = []
+    errors: list[dict] = []
+
+    first_idx = cfg.first_data_row - 1
+    last_idx = min(cfg.last_data_row - 1, len(df) - 1)
+
+    for row_idx in range(first_idx, last_idx + 1):
+        row = df.iloc[row_idx]
+
+        loss_block = clean_text(row.iloc[loss_idx]) if loss_idx < len(row) else ""
+        event_name = clean_text(row.iloc[event_idx]) if event_idx < len(row) else ""
+
+        if not event_name:
+            continue
+
+        if normalize_key(loss_block) == cfg.skip_loss_block:
+            continue
+
+        event_info = get_event_info(event_name)
+
+        quantity_value = 0.0
+        if quantity_idx is not None and quantity_idx < len(row):
+            quantity_value = get_numeric(row.iloc[quantity_idx], default=0.0)
+
+        has_valid_interval = False
+        has_any_time_value = False
+
+        for start_col, end_col in cfg.time_pairs:
+            start_idx = col_letter_to_index(start_col)
+            end_idx = col_letter_to_index(end_col)
+
+            start_raw = row.iloc[start_idx] if start_idx < len(row) else None
+            end_raw = row.iloc[end_idx] if end_idx < len(row) else None
+
+            pair_label = f"{start_col}-{end_col}"
+
+            if not pd.isna(start_raw) or not pd.isna(end_raw):
+                has_any_time_value = True
+
+            start_time = safe_to_datetime(start_raw)
+            end_time = safe_to_datetime(end_raw)
+
+            if pd.isna(start_time) and pd.isna(end_time):
+                continue
+
+            if pd.isna(start_time) or pd.isna(end_time):
+                errors.append(
+                    {
+                        "source_file_name": file_path.name,
+                        "source_file_path": str(file_path),
+                        "source_sheet_name": sheet_name,
+                        "source_row_number": row_idx + 1,
+                        "source_pair_label": pair_label,
+                        "error_type": "partial_time_interval",
+                        "error_details": "Заполнено только начало или только конец временного интервала",
+                    }
+                )
+                continue
+
+            if end_time < start_time:
+                errors.append(
+                    {
+                        "source_file_name": file_path.name,
+                        "source_file_path": str(file_path),
+                        "source_sheet_name": sheet_name,
+                        "source_row_number": row_idx + 1,
+                        "source_pair_label": pair_label,
+                        "error_type": "invalid_time_interval",
+                        "error_details": "Окончание раньше начала",
+                    }
+                )
+                continue
+
+            duration_min = round((end_time - start_time).total_seconds() / 60, 2)
+
+            records.append(
+                {
+                    "source_file_name": file_path.name,
+                    "source_file_path": str(file_path),
+                    "source_sheet_name": sheet_name,
+                    "source_row_number": row_idx + 1,
+                    "source_pair_label": pair_label,
+
+                    "month_key": file_info["month_key"],
+                    "month_num": file_info["month_num"],
+                    "year_num": file_info["year_num"],
+                    "day_num": day_num,
+
+                    "machine_model": file_info["machine_model"],
+                    "machine_tab_number": file_info["machine_tab_number"],
+
+                    "loss_block": loss_block,
+                    "event_name": event_name,
+                    "normalized_event_name": event_info["normalized_event"],
+                    "analytic_block": event_info["analytic_block"],
+                    "owner_group": event_info["owner_group"],
+
+                    "start_time": start_time.to_pydatetime(),
+                    "end_time": end_time.to_pydatetime(),
+                    "duration_min": duration_min,
+                    "has_time_interval": True,
+
+                    "quantity_value": quantity_value,
+                    "good_qty": 0.0,
+                    "defect_qty": 0.0,
+                    "actual_output": 0.0,
+
+                    "planned_time_min": 0.0,
+                    "standard_time_per_unit_min": cfg.default_standard_time_per_unit_min,
+                }
+            )
+
+            has_valid_interval = True
+
+        # Если по событию нет ни одного временного показателя, записываем его с нулевой длительностью.
+        if not has_valid_interval and not has_any_time_value:
+            records.append(
+                {
+                    "source_file_name": file_path.name,
+                    "source_file_path": str(file_path),
+                    "source_sheet_name": sheet_name,
+                    "source_row_number": row_idx + 1,
+                    "source_pair_label": "NO_TIME",
+
+                    "month_key": file_info["month_key"],
+                    "month_num": file_info["month_num"],
+                    "year_num": file_info["year_num"],
+                    "day_num": day_num,
+
+                    "machine_model": file_info["machine_model"],
+                    "machine_tab_number": file_info["machine_tab_number"],
+
+                    "loss_block": loss_block,
+                    "event_name": event_name,
+                    "normalized_event_name": event_info["normalized_event"],
+                    "analytic_block": event_info["analytic_block"],
+                    "owner_group": event_info["owner_group"],
+
+                    "start_time": None,
+                    "end_time": None,
+                    "duration_min": 0.0,
+                    "has_time_interval": False,
+
+                    "quantity_value": quantity_value,
+                    "good_qty": 0.0,
+                    "defect_qty": 0.0,
+                    "actual_output": 0.0,
+
+                    "planned_time_min": 0.0,
+                    "standard_time_per_unit_min": cfg.default_standard_time_per_unit_min,
+                }
+            )
+
+    return pd.DataFrame(records), pd.DataFrame(errors)
+
+
+def read_all_excel_files(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Читает Excel-файлы из структуры:
+
+    Data/
+        Аггрегатный станок/
+            234859/
+                Аггрегатный станок,234859,01.24.xlsm
+    """
+
+    excel_files = sorted(
+        [
+            *cfg.data_dir.glob("*/*/*.xlsx"),
+            *cfg.data_dir.glob("*/*/*.xlsm"),
+        ]
+    )
+
+    excel_files = [p for p in excel_files if not p.name.startswith("~$")]
+
+    print("Найденные Excel-файлы:")
+    for file in excel_files:
+        print(f"  {file}")
+
+    if not excel_files:
+        raise FileNotFoundError(
+            f"В папке {cfg.data_dir.resolve()} не найдены Excel-файлы. "
+            f"Ожидаемая структура: Data/модель_станка/табельный_номер/файл.xlsm"
+        )
+
+    all_records = []
+    all_errors = []
+
+    for file_path in excel_files:
+        print(f"\nЧтение файла: {file_path}")
+
+        for sheet_num in range(cfg.first_sheet, cfg.last_sheet + 1):
+            sheet_name = str(sheet_num)
+
+            try:
+                df = pd.read_excel(
+                    file_path,
+                    sheet_name=sheet_name,
+                    header=None,
+                    usecols="A:L",
+                    engine="openpyxl",
+                )
+            except ValueError:
+                continue
+
+            records_df, errors_df = build_records_from_sheet(
+                df=df,
+                file_path=file_path,
+                sheet_name=sheet_name,
+                cfg=cfg,
+            )
+
+            if not records_df.empty:
+                all_records.append(records_df)
+
+            if not errors_df.empty:
+                all_errors.append(errors_df)
+
+    records = pd.concat(all_records, ignore_index=True) if all_records else pd.DataFrame()
+    errors = pd.concat(all_errors, ignore_index=True) if all_errors else pd.DataFrame()
+
+    return records, errors
+
+
+# 6. ЗАГРУЗКА В POSTGRESQL
+def load_to_postgres(
+    records_df: pd.DataFrame,
+    errors_df: pd.DataFrame,
+    engine: Engine,
+    cfg: Config,
+) -> None:
+
+    if records_df.empty:
+        print("Нет записей для загрузки в PostgreSQL.")
+        return
+
+    loaded_file_paths = records_df["source_file_path"].dropna().unique().tolist()
+
+    with engine.begin() as conn:
+        if cfg.clear_existing_for_loaded_files:
+            for file_path in loaded_file_paths:
+                conn.execute(
+                    text(f"DELETE FROM {table_name(cfg, 'oee_event_records')} WHERE source_file_path = :source_file_path"),
+                    {"source_file_path": file_path},
+                )
+                conn.execute(
+                    text(f"DELETE FROM {table_name(cfg, 'oee_load_errors')} WHERE source_file_path = :source_file_path"),
+                    {"source_file_path": file_path},
+                )
+
+    records_df.to_sql(
+        "oee_event_records",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="append",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    if not errors_df.empty:
+        errors_df.to_sql(
+            "oee_load_errors",
+            engine,
+            schema=cfg.db_schema,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
+        )
+
+    print(f"Загружено записей событий: {len(records_df)}")
+    print(f"Записей с ошибками: {len(errors_df)}")
+
+
+# 7. РАСЧЁТ OEE
+def calculate_monthly_oee(engine: Engine, cfg: Config) -> pd.DataFrame:
+    query = f"""
+        SELECT
+            month_key,
+            machine_model,
+            machine_tab_number,
+            loss_block,
+            event_name,
+            normalized_event_name,
+            analytic_block,
+            duration_min,
+            quantity_value,
+            standard_time_per_unit_min
+        FROM {table_name(cfg, 'oee_event_records')};
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("В таблице oee_event_records нет данных для расчёта OEE.")
+        return pd.DataFrame()
+
+    df["event_key"] = (
+        df["event_name"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace("ё", "е", regex=False)
+    )
+
+    df["duration_min"] = pd.to_numeric(df["duration_min"], errors="coerce").fillna(0)
+    df["quantity_value"] = pd.to_numeric(df["quantity_value"], errors="coerce").fillna(0)
+
+    result_rows = []
+    group_cols = ["month_key", "machine_model", "machine_tab_number"]
+
+    for (month_key, machine_model, machine_tab_number), group in df.groupby(group_cols):
+        productive_mask = group["event_key"].eq("изготовление изделий")
+        break_mask = group["event_key"].eq("установленные перерывы")
+        good_mask = group["event_key"].eq("исправные изделия")
+        defect_mask = group["event_key"].eq("изделия несоответствующие установленному качеству")
+
+        # Потери: всё, кроме изготовления, перерывов и строк результата выпуска.
+        downtime_mask = ~(productive_mask | break_mask | good_mask | defect_mask)
+
+        downtime_min = float(group.loc[downtime_mask, "duration_min"].sum())
+        productive_time_min = float(group.loc[productive_mask, "duration_min"].sum())
+
+        # В текущей версии плановое время принимается как производительное время + потери.
+        # Если появится отдельный норматив планового времени, этот блок можно заменить.
+        planned_time_min = productive_time_min + downtime_min
+        actual_work_time_min = productive_time_min
+
+        actual_output_from_qty = float(group.loc[productive_mask, "quantity_value"].sum())
+        good_qty_from_qty = float(group.loc[good_mask, "quantity_value"].sum())
+        defect_qty_from_qty = float(group.loc[defect_mask, "quantity_value"].sum())
+
+        actual_output = actual_output_from_qty
+        good_qty = good_qty_from_qty
+        defect_qty = defect_qty_from_qty
+
+        # Тестовая оценка, если отдельный столбец количества не задан.
+        if actual_output == 0:
+            actual_output = float(productive_mask.sum())
+
+        if good_qty == 0:
+            good_qty = float(good_mask.sum())
+
+        if defect_qty == 0:
+            defect_qty = float(defect_mask.sum())
+
+        if actual_output == 0 and (good_qty + defect_qty) > 0:
+            actual_output = good_qty + defect_qty
+
+        if good_qty == 0 and actual_output > 0 and defect_qty == 0:
+            good_qty = actual_output
+
+        standard_time_per_unit_min = float(
+            pd.to_numeric(group["standard_time_per_unit_min"], errors="coerce")
+            .dropna()
+            .mean()
+        )
+
+        if standard_time_per_unit_min <= 0:
+            standard_time_per_unit_min = cfg.default_standard_time_per_unit_min
+
+        standard_output = (
+            actual_work_time_min / standard_time_per_unit_min
+            if standard_time_per_unit_min > 0
+            else np.nan
+        )
+
+        availability = (
+            actual_work_time_min / planned_time_min
+            if planned_time_min > 0
+            else np.nan
+        )
+
+        performance = (
+            actual_output / standard_output
+            if standard_output and standard_output > 0
+            else np.nan
+        )
+
+        quality = (
+            good_qty / actual_output
+            if actual_output > 0
+            else np.nan
+        )
+
+        oee = availability * performance * quality
+
+        oee_deviation = oee - cfg.oee_target if pd.notna(oee) else np.nan
+        oee_relative_deviation = (
+            oee_deviation / cfg.oee_target
+            if cfg.oee_target > 0 and pd.notna(oee_deviation)
+            else np.nan
+        )
+
+        result_rows.append(
+            {
+                "month_key": month_key,
+
+                "machine_model": machine_model,
+                "machine_tab_number": machine_tab_number,
+
+                "planned_time_min": round(planned_time_min, 2),
+                "downtime_min": round(downtime_min, 2),
+                "actual_work_time_min": round(actual_work_time_min, 2),
+
+                "actual_output": round(actual_output, 2),
+                "standard_output": round(standard_output, 2) if pd.notna(standard_output) else None,
+                "good_qty": round(good_qty, 2),
+                "defect_qty": round(defect_qty, 2),
+
+                "availability": round(availability, 4) if pd.notna(availability) else None,
+                "performance": round(performance, 4) if pd.notna(performance) else None,
+                "quality": round(quality, 4) if pd.notna(quality) else None,
+                "oee": round(oee, 4) if pd.notna(oee) else None,
+
+                "oee_target": cfg.oee_target,
+                "oee_deviation": round(oee_deviation, 4) if pd.notna(oee_deviation) else None,
+                "oee_relative_deviation": round(oee_relative_deviation, 4) if pd.notna(oee_relative_deviation) else None,
+            }
+        )
+
+    metrics_df = pd.DataFrame(result_rows)
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {table_name(cfg, 'oee_monthly_metrics')}"))
+
+    metrics_df.to_sql(
+        "oee_monthly_metrics",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="append",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_path = cfg.reports_dir / "oee_monthly_metrics.xlsx"
+    metrics_df.to_excel(metrics_path, index=False)
+
+    print(f"Расчёт OEE выполнен. Отчёт сохранён: {metrics_path}")
+
+    return metrics_df
+
+def calculate_daily_oee(engine: Engine, cfg: Config) -> pd.DataFrame:
+    query = f"""
+        SELECT
+            month_key,
+            month_num,
+            year_num,
+            day_num,
+            machine_model,
+            machine_tab_number,
+            loss_block,
+            event_name,
+            normalized_event_name,
+            analytic_block,
+            duration_min,
+            quantity_value,
+            standard_time_per_unit_min
+        FROM {table_name(cfg, 'oee_event_records')}
+        WHERE day_num IS NOT NULL;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("В таблице oee_event_records нет данных для дневного расчёта OEE.")
+        return pd.DataFrame()
+
+    df["event_key"] = (
+        df["event_name"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace("ё", "е", regex=False)
+    )
+
+    df["duration_min"] = pd.to_numeric(df["duration_min"], errors="coerce").fillna(0)
+    df["quantity_value"] = pd.to_numeric(df["quantity_value"], errors="coerce").fillna(0)
+
+    df["year_num"] = pd.to_numeric(df["year_num"], errors="coerce").astype("Int64")
+    df["month_num"] = pd.to_numeric(df["month_num"], errors="coerce").astype("Int64")
+    df["day_num"] = pd.to_numeric(df["day_num"], errors="coerce").astype("Int64")
+
+    df = df.dropna(subset=["year_num", "month_num", "day_num"])
+
+    df["day_key"] = pd.to_datetime(
+        dict(
+            year=df["year_num"].astype(int),
+            month=df["month_num"].astype(int),
+            day=df["day_num"].astype(int),
+        ),
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["day_key"])
+
+    result_rows = []
+    group_cols = ["day_key", "month_key", "machine_model", "machine_tab_number"]
+
+    for (day_key, month_key, machine_model, machine_tab_number), group in df.groupby(group_cols):
+        productive_mask = group["event_key"].eq("изготовление изделий")
+        break_mask = group["event_key"].eq("установленные перерывы")
+        good_mask = group["event_key"].eq("исправные изделия")
+        defect_mask = group["event_key"].eq("изделия несоответствующие установленному качеству")
+
+        downtime_mask = ~(productive_mask | break_mask | good_mask | defect_mask)
+
+        downtime_min = float(group.loc[downtime_mask, "duration_min"].sum())
+
+        planned_time_min = cfg.planned_time_per_day_min
+        actual_work_time_min = max(planned_time_min - downtime_min, 0)
+
+        actual_output_from_qty = float(group.loc[productive_mask, "quantity_value"].sum())
+        good_qty_from_qty = float(group.loc[good_mask, "quantity_value"].sum())
+        defect_qty_from_qty = float(group.loc[defect_mask, "quantity_value"].sum())
+
+        actual_output = actual_output_from_qty
+        good_qty = good_qty_from_qty
+        defect_qty = defect_qty_from_qty
+
+        if actual_output == 0:
+            actual_output = float(productive_mask.sum())
+
+        if good_qty == 0:
+            good_qty = float(good_mask.sum())
+
+        if defect_qty == 0:
+            defect_qty = float(defect_mask.sum())
+
+        if actual_output == 0 and (good_qty + defect_qty) > 0:
+            actual_output = good_qty + defect_qty
+
+        if good_qty == 0 and actual_output > 0 and defect_qty == 0:
+            good_qty = actual_output
+
+        standard_time_per_unit_min = float(
+            pd.to_numeric(group["standard_time_per_unit_min"], errors="coerce")
+            .dropna()
+            .mean()
+        )
+
+        if standard_time_per_unit_min <= 0:
+            standard_time_per_unit_min = cfg.default_standard_time_per_unit_min
+
+        standard_output = (
+            actual_work_time_min / standard_time_per_unit_min
+            if standard_time_per_unit_min > 0
+            else np.nan
+        )
+
+        availability = (
+            actual_work_time_min / planned_time_min
+            if planned_time_min > 0
+            else np.nan
+        )
+
+        performance = (
+            actual_output / standard_output
+            if standard_output and standard_output > 0 and actual_output > 0
+            else 1.0
+        )
+
+        quality = (
+            good_qty / actual_output
+            if actual_output > 0
+            else 1.0
+        )
+
+        oee = availability * performance * quality
+
+        oee_deviation = oee - cfg.oee_target if pd.notna(oee) else np.nan
+        oee_relative_deviation = (
+            oee_deviation / cfg.oee_target
+            if cfg.oee_target > 0 and pd.notna(oee_deviation)
+            else np.nan
+        )
+
+        result_rows.append(
+            {
+                "day_key": day_key.date(),
+                "month_key": month_key,
+
+                "machine_model": machine_model,
+                "machine_tab_number": machine_tab_number,
+
+                "planned_time_min": round(planned_time_min, 2),
+                "downtime_min": round(downtime_min, 2),
+                "actual_work_time_min": round(actual_work_time_min, 2),
+
+                "actual_output": round(actual_output, 2),
+                "standard_output": round(standard_output, 2) if pd.notna(standard_output) else None,
+                "good_qty": round(good_qty, 2),
+                "defect_qty": round(defect_qty, 2),
+
+                "availability": round(availability, 4) if pd.notna(availability) else None,
+                "performance": round(performance, 4) if pd.notna(performance) else None,
+                "quality": round(quality, 4) if pd.notna(quality) else None,
+                "oee": round(oee, 4) if pd.notna(oee) else None,
+
+                "oee_target": cfg.oee_target,
+                "oee_deviation": round(oee_deviation, 4) if pd.notna(oee_deviation) else None,
+                "oee_relative_deviation": round(oee_relative_deviation, 4) if pd.notna(oee_relative_deviation) else None,
+            }
+        )
+
+    daily_df = pd.DataFrame(result_rows)
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {table_name(cfg, 'oee_daily_metrics')}"))
+
+    daily_df.to_sql(
+        "oee_daily_metrics",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="append",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    daily_path = cfg.reports_dir / "oee_daily_metrics.xlsx"
+    daily_df.to_excel(daily_path, index=False)
+
+    print(f"Дневной расчёт OEE выполнен. Отчёт сохранён: {daily_path}")
+
+    return daily_df
+
+def build_weekly_deviation_report(engine: Engine, cfg: Config) -> pd.DataFrame:
+    """
+    Сравнивает последнюю отчётную неделю с исторически накопленными данными.
+
+    Последняя отчётная неделя определяется как 7 календарных дней,
+    заканчивающихся максимальной датой, найденной в oee_event_records.
+    Историческая база сравнения — все данные до начала последней отчётной недели.
+    """
+
+    query = f"""
+        SELECT
+            month_key,
+            year_num,
+            month_num,
+            day_num,
+            machine_model,
+            machine_tab_number,
+            loss_block,
+            event_name,
+            normalized_event_name,
+            analytic_block,
+            duration_min
+        FROM {table_name(cfg, 'oee_event_records')}
+        WHERE LOWER(loss_block) <> 'итоговый показатель блока'
+          AND day_num IS NOT NULL;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет данных для недельного анализа отклонений.")
+        return pd.DataFrame()
+
+    df["duration_min"] = pd.to_numeric(df["duration_min"], errors="coerce").fillna(0)
+
+    df["year_num"] = pd.to_numeric(df["year_num"], errors="coerce")
+    df["month_num"] = pd.to_numeric(df["month_num"], errors="coerce")
+    df["day_num"] = pd.to_numeric(df["day_num"], errors="coerce")
+
+    df = df.dropna(subset=["year_num", "month_num", "day_num"])
+
+    df["event_date"] = pd.to_datetime(
+        dict(
+            year=df["year_num"].astype(int),
+            month=df["month_num"].astype(int),
+            day=df["day_num"].astype(int),
+        ),
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["event_date"])
+
+    # Исключаем строки выпуска и результата, чтобы анализировать именно простои и потери
+    service_events = {
+        "изготовление изделий",
+        "исправные изделия",
+        "изделия несоответствующие установленному качеству",
+    }
+
+    df["event_key"] = (
+        df["event_name"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace("ё", "е", regex=False)
+    )
+
+    df = df[~df["event_key"].isin(service_events)].copy()
+
+    if df.empty:
+        print("После исключения строк выпуска не осталось данных для анализа простоев.")
+        return pd.DataFrame()
+
+    report_week_end = df["event_date"].max().normalize()
+    report_week_start = report_week_end - pd.Timedelta(days=6)
+
+    current_df = df[
+        (df["event_date"] >= report_week_start)
+        & (df["event_date"] <= report_week_end)
+    ].copy()
+
+    history_df = df[df["event_date"] < report_week_start].copy()
+
+    if current_df.empty:
+        print("За последнюю отчётную неделю нет событий для анализа.")
+        return pd.DataFrame()
+
+    group_cols = [
+        "machine_model",
+        "machine_tab_number",
+        "loss_block",
+        "event_name",
+        "normalized_event_name",
+        "analytic_block",
+    ]
+
+    current_week = (
+        current_df
+        .groupby(group_cols, as_index=False)
+        .agg(
+            current_week_loss_min=("duration_min", "sum"),
+            current_week_event_count=("duration_min", "count"),
+            current_avg_event_duration_min=("duration_min", "mean"),
+        )
+    )
+
+    if history_df.empty:
+        current_week["historical_week_avg_loss_min"] = np.nan
+        current_week["historical_week_avg_event_count"] = np.nan
+        current_week["historical_avg_event_duration_min"] = np.nan
+        current_week["absolute_deviation_min"] = np.nan
+        current_week["relative_deviation"] = np.nan
+        current_week["deviation_status"] = "нет исторических данных"
+        result = current_week.copy()
+    else:
+        # Приводим исторические данные к недельным суммам.
+        # Это важно: сравниваем последнюю неделю не со средним днём,
+        # а со средней неделей за всё предыдущее время.
+        history_df["week_start"] = (
+            history_df["event_date"]
+            - pd.to_timedelta(history_df["event_date"].dt.weekday, unit="D")
+        ).dt.normalize()
+
+        historical_weekly = (
+            history_df
+            .groupby(group_cols + ["week_start"], as_index=False)
+            .agg(
+                weekly_loss_min=("duration_min", "sum"),
+                weekly_event_count=("duration_min", "count"),
+                weekly_avg_event_duration_min=("duration_min", "mean"),
+            )
+        )
+
+        historical_avg = (
+            historical_weekly
+            .groupby(group_cols, as_index=False)
+            .agg(
+                historical_week_avg_loss_min=("weekly_loss_min", "mean"),
+                historical_week_avg_event_count=("weekly_event_count", "mean"),
+                historical_avg_event_duration_min=("weekly_avg_event_duration_min", "mean"),
+            )
+        )
+
+        result = current_week.merge(
+            historical_avg,
+            on=group_cols,
+            how="left",
+        )
+
+        result["absolute_deviation_min"] = (
+            result["current_week_loss_min"]
+            - result["historical_week_avg_loss_min"]
+        )
+
+        result["relative_deviation"] = np.where(
+            result["historical_week_avg_loss_min"] > 0,
+            result["absolute_deviation_min"] / result["historical_week_avg_loss_min"],
+            np.nan,
+        )
+
+        def classify_deviation(row) -> str:
+            rel = row["relative_deviation"]
+            abs_dev = row["absolute_deviation_min"]
+
+            if pd.isna(rel):
+                return "нет исторического среднего"
+
+            if rel >= 0.5 and abs_dev > 0:
+                return "существенный рост простоев"
+
+            if rel >= 0.2 and abs_dev > 0:
+                return "умеренный рост простоев"
+
+            if rel <= -0.2:
+                return "снижение простоев"
+
+            return "в пределах исторического уровня"
+
+        result["deviation_status"] = result.apply(classify_deviation, axis=1)
+
+    result["report_week_start"] = report_week_start.date()
+    result["report_week_end"] = report_week_end.date()
+
+    ordered_cols = [
+        "report_week_start",
+        "report_week_end",
+        "machine_model",
+        "machine_tab_number",
+        "loss_block",
+        "event_name",
+        "normalized_event_name",
+        "analytic_block",
+        "current_week_loss_min",
+        "historical_week_avg_loss_min",
+        "absolute_deviation_min",
+        "relative_deviation",
+        "current_week_event_count",
+        "historical_week_avg_event_count",
+        "current_avg_event_duration_min",
+        "historical_avg_event_duration_min",
+        "deviation_status",
+    ]
+
+    result = result[ordered_cols].copy()
+
+    numeric_cols = [
+        "current_week_loss_min",
+        "historical_week_avg_loss_min",
+        "absolute_deviation_min",
+        "relative_deviation",
+        "historical_week_avg_event_count",
+        "current_avg_event_duration_min",
+        "historical_avg_event_duration_min",
+    ]
+
+    for col in numeric_cols:
+        result[col] = pd.to_numeric(result[col], errors="coerce").round(4)
+
+    result = result.sort_values(
+        by=["absolute_deviation_min", "current_week_loss_min"],
+        ascending=[False, False],
+        na_position="last",
+    )
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {table_name(cfg, 'oee_weekly_deviation_report')}"))
+
+    result.to_sql(
+        "oee_weekly_deviation_report",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="append",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    report_path = cfg.reports_dir / "oee_weekly_deviation_report.xlsx"
+    result.to_excel(report_path, index=False)
+
+    print(f"Недельный отчёт отклонений сохранён: {report_path}")
+    print(f"Последняя отчётная неделя: {report_week_start.date()} — {report_week_end.date()}")
+
+    return result
+
+def build_weekly_oee_deviation_report(engine: Engine, cfg: Config) -> pd.DataFrame:
+    """
+    Рассчитывает средний OEE за последнюю отчётную неделю по каждому станку
+    и сравнивает его с историческим средним недельным OEE.
+    """
+
+    query = f"""
+        SELECT
+            day_key,
+            machine_model,
+            machine_tab_number,
+            planned_time_min,
+            downtime_min,
+            actual_work_time_min,
+            availability,
+            performance,
+            quality,
+            oee
+        FROM {table_name(cfg, 'oee_daily_metrics')}
+        ORDER BY day_key, machine_model, machine_tab_number;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет строк в oee_daily_metrics для расчёта недельного OEE.")
+        return pd.DataFrame()
+
+    df["day_key"] = pd.to_datetime(df["day_key"], errors="coerce")
+
+    numeric_cols = [
+        "planned_time_min",
+        "downtime_min",
+        "actual_work_time_min",
+        "availability",
+        "performance",
+        "quality",
+        "oee",
+    ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["day_key"])
+
+    # Если OEE не рассчитался, используем availability как временную оценку OEE.
+    # Это допустимо для тестового контура, если нет полноценного выпуска и качества.
+    df["oee_for_week"] = df["oee"]
+
+    df["oee_for_week"] = df["oee_for_week"].fillna(df["availability"])
+
+    calculated_availability = np.where(
+        df["planned_time_min"] > 0,
+        (df["planned_time_min"] - df["downtime_min"]) / df["planned_time_min"],
+        np.nan,
+    )
+
+    df["oee_for_week"] = df["oee_for_week"].fillna(
+        pd.Series(calculated_availability, index=df.index)
+    )
+
+    df = df.dropna(subset=["oee_for_week"])
+
+    if df.empty:
+        print("В oee_daily_metrics есть строки, но нет значений для расчёта недельного OEE.")
+        return pd.DataFrame()
+
+    report_week_end = df["day_key"].max().normalize()
+    report_week_start = report_week_end - pd.Timedelta(days=6)
+
+    current_df = df[
+        (df["day_key"] >= report_week_start)
+        & (df["day_key"] <= report_week_end)
+    ].copy()
+
+    history_df = df[df["day_key"] < report_week_start].copy()
+
+    if current_df.empty:
+        print("За последнюю отчётную неделю нет данных OEE.")
+        return pd.DataFrame()
+
+    group_cols = ["machine_model", "machine_tab_number"]
+
+    current_week = (
+        current_df
+        .groupby(group_cols, as_index=False)
+        .agg(
+            current_week_oee=("oee_for_week", "mean"),
+            current_week_availability=("availability", "mean"),
+            current_week_performance=("performance", "mean"),
+            current_week_quality=("quality", "mean"),
+            current_week_downtime_min=("downtime_min", "sum"),
+            observation_days=("day_key", "nunique"),
+        )
+    )
+
+    if history_df.empty:
+        result = current_week.copy()
+        result["historical_week_oee"] = np.nan
+        result["historical_week_downtime_min"] = np.nan
+        result["historical_weeks_count"] = 0
+        result["absolute_deviation_pp"] = np.nan
+        result["relative_deviation_percent"] = np.nan
+        result["oee_status"] = "нет исторических данных"
+    else:
+        history_df["week_start"] = (
+            history_df["day_key"]
+            - pd.to_timedelta(history_df["day_key"].dt.weekday, unit="D")
+        ).dt.normalize()
+
+        historical_weekly = (
+            history_df
+            .groupby(group_cols + ["week_start"], as_index=False)
+            .agg(
+                weekly_oee=("oee_for_week", "mean"),
+                weekly_downtime_min=("downtime_min", "sum"),
+            )
+        )
+
+        historical_avg = (
+            historical_weekly
+            .groupby(group_cols, as_index=False)
+            .agg(
+                historical_week_oee=("weekly_oee", "mean"),
+                historical_week_downtime_min=("weekly_downtime_min", "mean"),
+                historical_weeks_count=("week_start", "nunique"),
+            )
+        )
+
+        result = current_week.merge(
+            historical_avg,
+            on=group_cols,
+            how="left",
+        )
+
+        result["absolute_deviation_pp"] = (
+            result["current_week_oee"] - result["historical_week_oee"]
+        ) * 100
+
+        result["relative_deviation_percent"] = np.where(
+            result["historical_week_oee"] > 0,
+            (
+                (result["current_week_oee"] - result["historical_week_oee"])
+                / result["historical_week_oee"]
+            ) * 100,
+            np.nan,
+        )
+
+        def classify_oee_deviation(row) -> str:
+            deviation_pp = row["absolute_deviation_pp"]
+
+            if pd.isna(deviation_pp):
+                return "нет исторического среднего"
+
+            if deviation_pp <= -10:
+                return "существенное снижение OEE"
+
+            if deviation_pp <= -5:
+                return "умеренное снижение OEE"
+
+            if deviation_pp >= 5:
+                return "рост OEE"
+
+            return "в пределах исторического уровня"
+
+        result["oee_status"] = result.apply(classify_oee_deviation, axis=1)
+
+    result["report_week_start"] = report_week_start.date()
+    result["report_week_end"] = report_week_end.date()
+
+    result["current_week_oee_percent"] = result["current_week_oee"] * 100
+    result["historical_week_oee_percent"] = result["historical_week_oee"] * 100
+    result["current_week_availability_percent"] = result["current_week_availability"] * 100
+    result["current_week_performance_percent"] = result["current_week_performance"] * 100
+    result["current_week_quality_percent"] = result["current_week_quality"] * 100
+
+    ordered_cols = [
+        "report_week_start",
+        "report_week_end",
+        "machine_model",
+        "machine_tab_number",
+        "observation_days",
+        "current_week_oee_percent",
+        "historical_week_oee_percent",
+        "absolute_deviation_pp",
+        "relative_deviation_percent",
+        "current_week_availability_percent",
+        "current_week_performance_percent",
+        "current_week_quality_percent",
+        "current_week_downtime_min",
+        "historical_week_downtime_min",
+        "historical_weeks_count",
+        "oee_status",
+    ]
+
+    result = result[ordered_cols].copy()
+
+    numeric_cols = [
+        "current_week_oee_percent",
+        "historical_week_oee_percent",
+        "absolute_deviation_pp",
+        "relative_deviation_percent",
+        "current_week_availability_percent",
+        "current_week_performance_percent",
+        "current_week_quality_percent",
+        "current_week_downtime_min",
+        "historical_week_downtime_min",
+    ]
+
+    for col in numeric_cols:
+        result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
+
+    result = result.sort_values(
+        by=["current_week_oee_percent"],
+        ascending=True,
+        na_position="last",
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    report_path = cfg.reports_dir / "weekly_oee_deviation_report.xlsx"
+    result.to_excel(report_path, index=False)
+
+    result.to_sql(
+        "oee_weekly_oee_deviation_report",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="replace",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    print(f"Недельный отчёт OEE сохранён: {report_path}")
+    print(f"Отчётная неделя: {report_week_start.date()} — {report_week_end.date()}")
+
+    return result
+
+def build_weekly_oee_report(
+    engine: Engine,
+    cfg: Config,
+    report_week_start,
+    report_week_end,
+) -> pd.DataFrame:
+    """
+    Формирует отчёт по фактическому OEE за ту же неделю,
+    которая используется для анализа отклонений простоев.
+    """
+
+    query = f"""
+        SELECT
+            day_key,
+            machine_model,
+            machine_tab_number,
+            planned_time_min,
+            downtime_min,
+            actual_work_time_min,
+            actual_output,
+            standard_output,
+            good_qty,
+            defect_qty,
+            availability,
+            performance,
+            quality,
+            oee
+        FROM {table_name(cfg, 'oee_daily_metrics')}
+        WHERE day_key BETWEEN :week_start AND :week_end
+          AND oee IS NOT NULL
+        ORDER BY day_key, machine_model, machine_tab_number;
+    """
+
+    df = pd.read_sql(
+        text(query),
+        engine,
+        params={
+            "week_start": report_week_start,
+            "week_end": report_week_end,
+        },
+    )
+
+    if df.empty:
+        print("Нет данных для расчёта недельного OEE.")
+        return pd.DataFrame()
+
+    numeric_cols = [
+        "planned_time_min",
+        "downtime_min",
+        "actual_work_time_min",
+        "actual_output",
+        "standard_output",
+        "good_qty",
+        "defect_qty",
+        "availability",
+        "performance",
+        "quality",
+        "oee",
+    ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    group_cols = ["machine_model", "machine_tab_number"]
+
+    weekly_df = (
+        df
+        .groupby(group_cols, as_index=False)
+        .agg(
+            observation_days=("day_key", "nunique"),
+            planned_time_min=("planned_time_min", "sum"),
+            downtime_min=("downtime_min", "sum"),
+            actual_work_time_min=("actual_work_time_min", "sum"),
+            actual_output=("actual_output", "sum"),
+            standard_output=("standard_output", "sum"),
+            good_qty=("good_qty", "sum"),
+            defect_qty=("defect_qty", "sum"),
+            daily_oee_mean=("oee", "mean"),
+        )
+    )
+
+    weekly_df["availability_week"] = np.where(
+        weekly_df["planned_time_min"] > 0,
+        weekly_df["actual_work_time_min"] / weekly_df["planned_time_min"],
+        np.nan,
+    )
+
+    weekly_df["performance_week"] = np.where(
+        weekly_df["standard_output"] > 0,
+        weekly_df["actual_output"] / weekly_df["standard_output"],
+        np.nan,
+    )
+
+    weekly_df["quality_week"] = np.where(
+        weekly_df["actual_output"] > 0,
+        weekly_df["good_qty"] / weekly_df["actual_output"],
+        np.nan,
+    )
+
+    weekly_df["oee_week"] = (
+        weekly_df["availability_week"]
+        * weekly_df["performance_week"]
+        * weekly_df["quality_week"]
+    )
+
+    weekly_df["oee_percent"] = weekly_df["oee_week"] * 100
+    weekly_df["availability_percent"] = weekly_df["availability_week"] * 100
+    weekly_df["performance_percent"] = weekly_df["performance_week"] * 100
+    weekly_df["quality_percent"] = weekly_df["quality_week"] * 100
+    weekly_df["daily_oee_mean_percent"] = weekly_df["daily_oee_mean"] * 100
+
+    weekly_df["oee_target_percent"] = cfg.oee_target * 100
+    weekly_df["oee_deviation_pp"] = (
+        weekly_df["oee_percent"] - weekly_df["oee_target_percent"]
+    )
+
+    weekly_df["report_week_start"] = pd.to_datetime(report_week_start).date()
+    weekly_df["report_week_end"] = pd.to_datetime(report_week_end).date()
+
+    ordered_cols = [
+        "report_week_start",
+        "report_week_end",
+        "machine_model",
+        "machine_tab_number",
+        "observation_days",
+        "planned_time_min",
+        "downtime_min",
+        "actual_work_time_min",
+        "actual_output",
+        "standard_output",
+        "good_qty",
+        "defect_qty",
+        "availability_percent",
+        "performance_percent",
+        "quality_percent",
+        "oee_percent",
+        "daily_oee_mean_percent",
+        "oee_target_percent",
+        "oee_deviation_pp",
+    ]
+
+    weekly_df = weekly_df[ordered_cols].copy()
+
+    for col in weekly_df.columns:
+        if col not in ["report_week_start", "report_week_end", "machine_model", "machine_tab_number"]:
+            weekly_df[col] = pd.to_numeric(weekly_df[col], errors="ignore")
+
+    round_cols = [
+        "planned_time_min",
+        "downtime_min",
+        "actual_work_time_min",
+        "actual_output",
+        "standard_output",
+        "good_qty",
+        "defect_qty",
+        "availability_percent",
+        "performance_percent",
+        "quality_percent",
+        "oee_percent",
+        "daily_oee_mean_percent",
+        "oee_target_percent",
+        "oee_deviation_pp",
+    ]
+
+    for col in round_cols:
+        weekly_df[col] = pd.to_numeric(weekly_df[col], errors="coerce").round(2)
+
+    weekly_df = weekly_df.sort_values(
+        by=["oee_percent", "downtime_min"],
+        ascending=[True, False],
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    weekly_oee_path = cfg.reports_dir / "oee_weekly_oee_report.xlsx"
+    weekly_df.to_excel(weekly_oee_path, index=False)
+
+    weekly_df.to_sql(
+        "oee_weekly_oee_report",
+        engine,
+        schema=cfg.db_schema,
+        if_exists="replace",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+
+    print(f"Недельный отчёт OEE сохранён: {weekly_oee_path}")
+
+    return weekly_df
+
+def plot_weekly_oee_by_machine(weekly_oee_df: pd.DataFrame, cfg: Config) -> None:
+    if weekly_oee_df.empty:
+        print("Нет данных для построения графика недельного OEE.")
+        return
+
+    plot_df = weekly_oee_df.copy()
+
+    plot_df["machine_label"] = (
+        plot_df["machine_model"].astype(str)
+        + " № "
+        + plot_df["machine_tab_number"].astype(str)
+    )
+
+    plot_df = plot_df.sort_values("oee_percent", ascending=True)
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ax = plot_df.plot(
+        kind="barh",
+        x="machine_label",
+        y="oee_percent",
+        figsize=(12, 6),
+        legend=False,
+    )
+
+    ax.axvline(cfg.oee_target * 100, linewidth=1)
+
+    ax.set_title("Фактический OEE за последнюю отчётную неделю")
+    ax.set_xlabel("OEE, %")
+    ax.set_ylabel("Станок")
+    ax.grid(True, axis="x")
+
+    for container in ax.containers:
+        labels = [f"{value:.1f}%" for value in container.datavalues]
+
+        ax.bar_label(
+            container,
+            labels=labels,
+            padding=3,
+            fontsize=8,
+        )
+
+    ax.text(
+        0.5,
+        -0.12,
+        "Вертикальная линия показывает целевой уровень OEE.",
+        transform=ax.transAxes,
+        ha="center",
+        fontsize=9,
+    )
+
+    plt.tight_layout()
+
+    output_path = cfg.reports_dir / "weekly_oee_by_machine.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+def plot_weekly_oee_deviation_by_machine(report_df: pd.DataFrame, cfg: Config) -> Optional[Path]:
+    if report_df.empty:
+        print("Нет данных для построения графика отклонения OEE.")
+        return None
+
+    plot_df = report_df.dropna(subset=["current_week_oee_percent"]).copy()
+
+    if plot_df.empty:
+        print("Нет рассчитанных значений OEE для построения графика.")
+        return None
+
+    plot_df["machine_label"] = (
+        plot_df["machine_model"].astype(str)
+        + " № "
+        + plot_df["machine_tab_number"].astype(str)
+    )
+
+    plot_df = plot_df.sort_values("current_week_oee_percent", ascending=True)
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ax = plot_df.plot(
+        kind="barh",
+        x="machine_label",
+        y="current_week_oee_percent",
+        figsize=(12, 7),
+        legend=False,
+    )
+
+    ax.axvline(cfg.oee_target * 100, linewidth=1)
+
+    ax.set_title("Средний OEE за последнюю отчётную неделю по станкам")
+    ax.set_xlabel("Средний OEE за неделю, %")
+    ax.set_ylabel("Станок")
+    ax.grid(True, axis="x")
+
+    for container in ax.containers:
+        labels = []
+
+        for value, (_, row) in zip(container.datavalues, plot_df.iterrows()):
+            dev = row.get("absolute_deviation_pp")
+
+            if pd.isna(dev):
+                labels.append(f"{value:.1f}%")
+            elif dev > 0:
+                labels.append(f"{value:.1f}% / +{dev:.1f} п.п.")
+            else:
+                labels.append(f"{value:.1f}% / {dev:.1f} п.п.")
+
+        ax.bar_label(
+            container,
+            labels=labels,
+            padding=3,
+            fontsize=8,
+        )
+
+    ax.text(
+        0.5,
+        -0.14,
+        "Подпись показывает недельный OEE и отклонение от исторического среднего в процентных пунктах.",
+        transform=ax.transAxes,
+        ha="center",
+        fontsize=9,
+    )
+
+    plt.tight_layout()
+
+    output_path = cfg.reports_dir / "weekly_oee_deviation_by_machine.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+    print(f"График недельного OEE сохранён: {output_path}")
+
+    return output_path
+
+    print(f"График недельного OEE сохранён: {output_path}")
+
+# 8. ГРАФИК ПОМЕСЯЧНЫХ ПОТЕРЬ
+def plot_monthly_losses(engine: Engine, cfg: Config) -> None:
+    query = f"""
+        SELECT
+            month_key,
+            loss_block,
+            SUM(duration_min) AS total_loss_min
+        FROM {table_name(cfg, 'oee_event_records')}
+        WHERE LOWER(loss_block) <> 'итоговый показатель блока'
+        GROUP BY month_key, loss_block
+        ORDER BY month_key, loss_block;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет данных для построения общего графика потерь.")
+        return
+
+    df["month_key"] = pd.to_datetime(df["month_key"])
+
+    pivot = df.pivot_table(
+        index="month_key",
+        columns="loss_block",
+        values="total_loss_min",
+        aggfunc="sum",
+        fill_value=0,
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ax = pivot.plot(kind="line", marker="o", figsize=(12, 6))
+
+    ax.set_title("Помесячная динамика производственных потерь")
+    ax.set_xlabel("Месяц")
+    ax.set_ylabel("Суммарная длительность потерь, мин")
+    ax.grid(True)
+
+    plt.tight_layout()
+
+    output_path = cfg.reports_dir / "monthly_losses.png"
+    plt.savefig(output_path, dpi=300)
+    plt.show()
+
+    print(f"График сохранён: {output_path}")
+
+
+def plot_losses_by_machine(engine: Engine, cfg: Config) -> None:
+    query = f"""
+        SELECT
+            month_key,
+            machine_model,
+            machine_tab_number,
+            loss_block,
+            SUM(duration_min) AS total_loss_min
+        FROM {table_name(cfg, 'oee_event_records')}
+        WHERE LOWER(loss_block) <> 'итоговый показатель блока'
+        GROUP BY month_key, machine_model, machine_tab_number, loss_block
+        ORDER BY month_key, machine_model, machine_tab_number, loss_block;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет данных для построения графиков по станкам.")
+        return
+
+    df["month_key"] = pd.to_datetime(df["month_key"])
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    for (machine_model, machine_tab_number), group in df.groupby(["machine_model", "machine_tab_number"]):
+        pivot = group.pivot_table(
+            index="month_key",
+            columns="loss_block",
+            values="total_loss_min",
+            aggfunc="sum",
+            fill_value=0,
+        )
+
+        ax = pivot.plot(kind="line", marker="o", figsize=(12, 6))
+
+        ax.set_title(f"Помесячные потери: {machine_model}, таб. № {machine_tab_number}")
+        ax.set_xlabel("Месяц")
+        ax.set_ylabel("Суммарная длительность потерь, мин")
+        ax.grid(True)
+
+        plt.tight_layout()
+
+        safe_model = str(machine_model).replace(" ", "_").replace("/", "_").replace("\\", "_")
+        safe_tab = str(machine_tab_number).replace(" ", "_").replace("/", "_").replace("\\", "_")
+
+        output_path = cfg.reports_dir / f"monthly_losses_{safe_model}_{safe_tab}.png"
+
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+
+        print(f"График по станку сохранён: {output_path}")
+
+def plot_daily_oee_by_machine(engine: Engine, cfg: Config) -> None:
+    query = f"""
+        SELECT
+            day_key,
+            machine_model,
+            machine_tab_number,
+            oee
+        FROM {table_name(cfg, 'oee_daily_metrics')}
+        WHERE oee IS NOT NULL
+        ORDER BY day_key, machine_model, machine_tab_number;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет данных для построения графика дневного OEE.")
+        return
+
+    df["day_key"] = pd.to_datetime(df["day_key"])
+
+    df["machine_label"] = (
+        df["machine_model"].astype(str)
+        + " № "
+        + df["machine_tab_number"].astype(str)
+    )
+
+    pivot = df.pivot_table(
+        index="day_key",
+        columns="machine_label",
+        values="oee",
+        aggfunc="mean",
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ax = pivot.plot(kind="line", marker="o", figsize=(14, 7))
+
+    ax.set_title("Дневная динамика OEE по табельным номерам техники")
+    ax.set_xlabel("Дата")
+    ax.set_ylabel("OEE")
+    ax.grid(True)
+
+    plt.tight_layout()
+
+    output_path = cfg.reports_dir / "daily_oee_by_machine.png"
+    plt.savefig(output_path, dpi=300)
+    plt.show()
+
+    print(f"График дневного OEE сохранён: {output_path}")
+
+# Функция сравнения по табельным номерам
+def build_machine_oee_comparison(engine: Engine, cfg: Config) -> pd.DataFrame:
+    query = f"""
+        SELECT
+            day_key,
+            machine_model,
+            machine_tab_number,
+            oee,
+            availability,
+            performance,
+            quality,
+            downtime_min
+        FROM {table_name(cfg, 'oee_daily_metrics')}
+        WHERE oee IS NOT NULL;
+    """
+
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        print("Нет данных для сравнения OEE по табельным номерам.")
+        return pd.DataFrame()
+
+    df["day_key"] = pd.to_datetime(df["day_key"])
+    df["oee"] = pd.to_numeric(df["oee"], errors="coerce")
+    df["downtime_min"] = pd.to_numeric(df["downtime_min"], errors="coerce").fillna(0)
+
+    latest_day = df["day_key"].max()
+    latest_df = df[df["day_key"] == latest_day].copy()
+
+    history = (
+        df.groupby(["machine_model", "machine_tab_number"], as_index=False)
+        .agg(
+            oee_all_time_mean=("oee", "mean"),
+            oee_all_time_min=("oee", "min"),
+            oee_all_time_max=("oee", "max"),
+            total_observation_days=("day_key", "nunique"),
+            total_downtime_min=("downtime_min", "sum"),
+        )
+    )
+
+    latest = (
+        latest_df.groupby(["machine_model", "machine_tab_number"], as_index=False)
+        .agg(
+            latest_day=("day_key", "max"),
+            oee_today=("oee", "mean"),
+            availability_today=("availability", "mean"),
+            performance_today=("performance", "mean"),
+            quality_today=("quality", "mean"),
+            downtime_today_min=("downtime_min", "sum"),
+        )
+    )
+
+    comparison = latest.merge(
+        history,
+        on=["machine_model", "machine_tab_number"],
+        how="left",
+    )
+
+    comparison["oee_today_deviation_from_mean"] = (
+        comparison["oee_today"] - comparison["oee_all_time_mean"]
+    )
+
+    comparison["oee_today_relative_deviation_from_mean"] = np.where(
+        comparison["oee_all_time_mean"] > 0,
+        comparison["oee_today_deviation_from_mean"] / comparison["oee_all_time_mean"],
+        np.nan,
+    )
+
+    comparison = comparison.sort_values(
+        by=["oee_today", "oee_today_deviation_from_mean"],
+        ascending=[True, True],
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    comparison_path = cfg.reports_dir / "oee_machine_comparison.xlsx"
+    comparison.to_excel(comparison_path, index=False)
+
+    print(f"Сравнение OEE по табельным номерам сохранено: {comparison_path}")
+    print(f"Последний день в данных: {latest_day.date()}")
+
+    return comparison
+
+def print_weekly_deviation_summary(report_df: pd.DataFrame, cfg: Config) -> None:
+    if report_df.empty:
+        print("Недельный отчёт пуст, краткая статистика не сформирована.")
+        return
+
+    growth_df = report_df[
+        report_df["deviation_status"].isin(
+            ["существенный рост простоев", "умеренный рост простоев"]
+        )
+    ].copy()
+
+    decline_df = report_df[
+        report_df["deviation_status"].eq("снижение простоев")
+    ].copy()
+
+    top_growth = growth_df.head(10)
+
+    lines = []
+
+    week_start = report_df["report_week_start"].iloc[0]
+    week_end = report_df["report_week_end"].iloc[0]
+
+    lines.append(f"Краткая статистика за отчётную неделю: {week_start} — {week_end}")
+    lines.append("")
+    lines.append(f"Всего событий с отклонениями вверх: {len(growth_df)}")
+    lines.append(f"Всего событий со снижением простоев: {len(decline_df)}")
+    lines.append("")
+
+    if not top_growth.empty:
+        lines.append("Наибольший рост простоев относительно исторического среднего:")
+
+        for _, row in top_growth.iterrows():
+            rel = row["relative_deviation"]
+            rel_text = "нет данных" if pd.isna(rel) else f"{rel * 100:.1f}%"
+
+            lines.append(
+                f"- {row['machine_model']} № {row['machine_tab_number']}: "
+                f"{row['event_name']} — "
+                f"{row['current_week_loss_min']:.2f} мин за неделю; "
+                f"историческое среднее: {row['historical_week_avg_loss_min']:.2f} мин; "
+                f"отклонение: {row['absolute_deviation_min']:.2f} мин ({rel_text})."
+            )
+    else:
+        lines.append("Рост простоев относительно исторического среднего не выявлен.")
+
+    summary_text = "\n".join(lines)
+
+    print("\n" + summary_text)
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = cfg.reports_dir / "weekly_deviation_summary.txt"
+    summary_path.write_text(summary_text, encoding="utf-8")
+
+    print(f"Краткая статистика сохранена: {summary_path}")
+
+def plot_weekly_deviation_top_events(report_df: pd.DataFrame, cfg: Config) -> None:
+    if report_df.empty:
+        print("Нет данных для построения графика недельных отклонений.")
+        return
+
+    plot_df = report_df.dropna(subset=["absolute_deviation_min"]).copy()
+
+    if plot_df.empty:
+        print("Нет рассчитанных отклонений для построения графика.")
+        return
+
+    # Берём события с самым большим отклонением по модулю:
+    # как в сторону роста простоев, так и в сторону снижения.
+    plot_df["abs_deviation_module"] = plot_df["absolute_deviation_min"].abs()
+
+    plot_df = (
+        plot_df
+        .sort_values("abs_deviation_module", ascending=False)
+        .head(15)
+        .sort_values("absolute_deviation_min", ascending=True)
+    )
+
+    # Формируем подпись для оси Y
+    plot_df["label"] = (
+        plot_df["machine_model"].astype(str)
+        + " № "
+        + plot_df["machine_tab_number"].astype(str)
+        + " | "
+        + plot_df["event_name"].astype(str)
+    )
+
+    # Текстовая интерпретация направления отклонения
+    plot_df["deviation_direction"] = np.where(
+        plot_df["absolute_deviation_min"] > 0,
+        "рост простоев",
+        np.where(
+            plot_df["absolute_deviation_min"] < 0,
+            "снижение простоев",
+            "без отклонения"
+        )
+    )
+
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ax = plot_df.plot(
+        kind="barh",
+        x="label",
+        y="absolute_deviation_min",
+        figsize=(13, 8),
+        legend=False,
+    )
+
+    # Нулевая линия: справа от неё рост простоев, слева — снижение.
+    ax.axvline(0, linewidth=1)
+
+    ax.set_title("Отклонение простоев за последнюю отчётную неделю от исторического среднего")
+    ax.set_xlabel("Отклонение от исторического среднего, мин")
+    ax.set_ylabel("Станок и событие")
+    ax.grid(True, axis="x")
+
+    # Подписи на столбцах с явным знаком + или -
+    for container in ax.containers:
+        labels = []
+
+        for value in container.datavalues:
+            if value > 0:
+                labels.append(f"+{value:.1f} мин")
+            elif value < 0:
+                labels.append(f"{value:.1f} мин")
+            else:
+                labels.append("0 мин")
+
+        ax.bar_label(
+            container,
+            labels=labels,
+            padding=3,
+            fontsize=8
+        )
+
+    # Пояснение под графиком
+    ax.text(
+        0.5,
+        -0.12,
+        "Положительное значение означает рост простоев; отрицательное — снижение относительно исторического среднего.",
+        transform=ax.transAxes,
+        ha="center",
+        fontsize=9
+    )
+
+    plt.tight_layout()
+
+    output_path = cfg.reports_dir / "weekly_deviation_top_events.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print(f"График недельных отклонений сохранён: {output_path}")
+
+def send_email_with_attachments(
+    cfg: Config,
+    subject: str,
+    body: str,
+    attachment_paths: list[Path],
+) -> None:
+    smtp_user = os.getenv(cfg.smtp_user_env)
+    smtp_password = os.getenv(cfg.smtp_password_env)
+
+    if not smtp_user or not smtp_password:
+        print(
+            "Письмо не отправлено: не заданы переменные окружения "
+            f"{cfg.smtp_user_env} и/или {cfg.smtp_password_env}."
+        )
+        return
+
+    valid_attachments = [
+        Path(path)
+        for path in attachment_paths
+        if path is not None and Path(path).exists()
+    ]
+
+    if not valid_attachments:
+        print("Письмо не отправлено: нет файлов для вложения.")
+        return
+
+    message = EmailMessage()
+    message["From"] = smtp_user
+    message["To"] = cfg.email_recipient
+    message["Subject"] = subject
+    message.set_content(body)
+
+    for path in valid_attachments:
+        mime_type, _ = mimetypes.guess_type(path)
+
+        if mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+
+        with open(path, "rb") as file:
+            message.add_attachment(
+                file.read(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
+
+    with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as smtp:
+        smtp.starttls()
+        smtp.login(smtp_user, smtp_password)
+        smtp.send_message(message)
+
+    print(f"Письмо с графиками отправлено на адрес: {cfg.email_recipient}")
+
+
+# 9. ДИАГНОСТИКА ПОДКЛЮЧЕНИЯ
+def print_database_diagnostics(engine: Engine, cfg: Config) -> None:
+    with engine.connect() as conn:
+        db_name = conn.execute(text("SELECT current_database()")).scalar()
+        current_schema = conn.execute(text("SELECT current_schema()")).scalar()
+
+        count_events = conn.execute(
+            text(f"SELECT COUNT(*) FROM {table_name(cfg, 'oee_event_records')}")
+        ).scalar()
+
+        count_metrics = conn.execute(
+            text(f"SELECT COUNT(*) FROM {table_name(cfg, 'oee_monthly_metrics')}")
+        ).scalar()
+
+        count_daily = conn.execute(
+            text(f"SELECT COUNT(*) FROM {table_name(cfg, 'oee_daily_metrics')}")
+        ).scalar()
+
+    print("\nДиагностика PostgreSQL:")
+    print(f"База данных: {db_name}")
+    print(f"Текущая схема по умолчанию: {current_schema}")
+    print(f'Строк в "{cfg.db_schema}".oee_event_records: {count_events}')
+    print(f'Строк в "{cfg.db_schema}".oee_monthly_metrics: {count_metrics}')
+    print(f'Строк в "{cfg.db_schema}".oee_daily_metrics: {count_daily}')
+
+
+# 10. ОБЩИЙ ЗАПУСК
+
+def run_pipeline(cfg: Config) -> None:
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    engine = get_engine(cfg)
+
+    create_tables(engine, cfg)
+
+    records_df, errors_df = read_all_excel_files(cfg)
+
+    print("\nПредварительный просмотр загружаемых данных:")
+    print(records_df.head())
+
+    load_to_postgres(records_df, errors_df, engine, cfg)
+
+    print_database_diagnostics(engine, cfg)
+
+    # 1. Расчёт дневного OEE
+    daily_df = calculate_daily_oee(engine, cfg)
+
+    print("\nИтоговые дневные значения OEE:")
+    print(daily_df)
+
+    # 2. Отчёт по отклонениям простоев в разрезе событий
+    weekly_deviation_df = build_weekly_deviation_report(engine, cfg)
+
+    print("\nОтклонения последней отчётной недели от исторического среднего:")
+    print(weekly_deviation_df.head(20))
+
+    # 3. Краткая текстовая статистика по простоям
+    print_weekly_deviation_summary(weekly_deviation_df, cfg)
+
+    # 4. График отклонений по событиям, мин
+    plot_weekly_deviation_top_events(weekly_deviation_df, cfg)
+
+    # 5. Новый отчёт: средний недельный OEE по каждому станку
+    #    и отклонение от исторического среднего OEE
+    weekly_oee_deviation_df = build_weekly_oee_deviation_report(engine, cfg)
+
+    print("\nСредний OEE за последнюю отчётную неделю по станкам:")
+    print(weekly_oee_deviation_df)
+
+    # 6. Новый график: недельный OEE и отклонение от исторического уровня
+    weekly_oee_chart_path = plot_weekly_oee_deviation_by_machine(
+        weekly_oee_deviation_df,
+        cfg,
+    )
+
+    # 7. Путь к графику отклонений простоев
+    weekly_deviation_chart_path = cfg.reports_dir / "weekly_deviation_top_events.png"
+
+    attachments = []
+
+    if weekly_deviation_chart_path.exists():
+        attachments.append(weekly_deviation_chart_path)
+    else:
+        print(f"График отклонений простоев не найден: {weekly_deviation_chart_path}")
+
+    if weekly_oee_chart_path is not None and Path(weekly_oee_chart_path).exists():
+        attachments.append(weekly_oee_chart_path)
+    else:
+        print("График недельного OEE не найден или не был сформирован.")
+
+    send_email_with_attachments(
+        cfg=cfg,
+        subject="OEE: недельный отчёт по станкам",
+        body=(
+            "Добрый день.\n\n"
+            "Во вложении направлены графики по результатам недельного анализа OEE.\n\n"
+            "В отчёт включены:\n"
+            "1. отклонения простоев по событиям относительно исторического среднего;\n"
+            "2. средний OEE за последнюю отчётную неделю по каждому станку "
+            "и отклонение от исторического значения.\n\n"
+            "Отчёт сформирован автоматически."
+        ),
+        attachment_paths=attachments,
+    )
+
+    print_database_diagnostics(engine, cfg)
+
+    print("\nОбработка завершена.")
+
+
+if __name__ == "__main__":
+    run_pipeline(CFG)
